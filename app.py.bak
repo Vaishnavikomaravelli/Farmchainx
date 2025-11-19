@@ -1,0 +1,326 @@
+# app.py
+import os
+import time
+import uuid
+import json
+from flask import Flask, request, render_template, send_from_directory, jsonify, g
+from ultralytics import YOLO
+from werkzeug.utils import secure_filename
+
+# -------------------------
+# Config
+# -------------------------
+app = Flask(__name__)
+# change this to where you want uploaded files stored
+app.config["UPLOAD_FOLDER"] = r"C:\Users\saidp\Downloads\farmchainx\static\uploads"
+os.makedirs(app.config["UPLOAD_FOLDER"], exist_ok=True)
+
+# location to persist YOLO output images (runs/detect/predict)
+# ultralytics writes to runs/detect/predict by default; keep a copy to serve if necessary
+OUTPUT_BASE = os.path.abspath("runs/detect/predict")
+
+# replace with your real model path (from your uploaded file). See your uploaded app file for path. :contentReference[oaicite:2]{index=2}
+MODEL_PATH = r"C:\Users\saidp\Downloads\farmchainx\best.pt"
+
+# persist audits to disk (JSONL) for now; replace with DB in production
+AUDIT_LOG_FILE = os.path.join(os.path.dirname(__file__), "audits.jsonl")
+AUDIT_STORE = {}  # quick in-memory index: request_id -> audit (useful during runtime)
+
+# -------------------------
+# Load model
+# -------------------------
+model = YOLO(MODEL_PATH)
+MODEL_VERSION = "custom-best"  # update as you version models
+
+# -------------------------
+# Utility functions
+# -------------------------
+def now_ts():
+    return time.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+def calibrate_confidence(raw_conf):
+    """
+    Simple calibration stub. Replace with trained isotonic/platt model later.
+    Keeps value in [0,1].
+    """
+    # small bias to simulate calibration; replace with ml model
+    cal = max(0.0, min(1.0, raw_conf - 0.02))
+    return round(cal, 4)
+
+def compute_quality_score(probabilities, metadata=None):
+    """
+    Small quality scoring combining:
+    - max confidence (70%)
+    - input checks (20%) — here we assume uploaded image ok (1.0)
+    - explainability presence (10%) — placeholder as 1.0
+    Replace with richer checks (resolution, missing fields, drift checks, etc).
+    """
+    if not probabilities:
+        return 0.0
+    confidence = max(probabilities.values())
+    completeness = 1.0
+    explainability = 1.0
+    score = confidence * 0.7 + completeness * 0.2 + explainability * 0.1
+    return round(score, 4)
+
+def append_audit(audit):
+    """Append audit JSON to file and update in-memory store."""
+    request_id = audit.get("request_id")
+    try:
+        with open(AUDIT_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(audit, default=str) + "\n")
+    except Exception as e:
+        app.logger.exception("Failed to write audit: %s", e)
+    if request_id:
+        AUDIT_STORE[request_id] = audit
+
+# -------------------------
+# Request timing middleware
+# -------------------------
+@app.before_request
+def before_request():
+    g.start_time = time.time()
+
+@app.after_request
+def after_request(response):
+    # optionally log API calls for /api/v1/...
+    try:
+        if request.path.startswith("/api/v1/") or request.path == "/predict":
+            duration_ms = int((time.time() - getattr(g, "start_time", time.time())) * 1000)
+            body = None
+            try:
+                body = request.get_json(silent=True)
+            except Exception:
+                body = None
+            audit = {
+                "request_id": (body or {}).get("request_id") if isinstance(body, dict) else None,
+                "path": request.path,
+                "method": request.method,
+                "request_body": body if body is not None else "<multipart or form data>",
+                "response_status": response.status_code,
+                "response_snippet": (response.get_data(as_text=True)[:2000] if response.get_data else ""),
+                "duration_ms": duration_ms,
+                "timestamp": now_ts()
+            }
+            # store quick audit
+            append_audit(audit)
+    except Exception:
+        app.logger.exception("audit middleware error")
+    return response
+
+# -------------------------
+# HTML routes (existing)
+# -------------------------
+@app.route("/")
+def home():
+    return render_template("index.html")
+
+@app.route("/predict", methods=["POST"])
+def predict_html():
+    """
+    Existing HTML flow:
+    - Accept file upload (form)
+    - Save file
+    - Run YOLO.predict(file_path, save=True)
+    - Render result.html with uploaded_image, result_image, detections
+    """
+    if 'image' not in request.files:
+        return "No image uploaded", 400
+
+    file = request.files['image']
+    filename = secure_filename(file.filename)
+    if filename == "":
+        filename = f"{uuid.uuid4().hex}.jpg"
+    file_path = os.path.join(app.config["UPLOAD_FOLDER"], filename)
+    file.save(file_path)
+
+    t0 = time.time()
+    results = model.predict(file_path, save=True)  # keeps your original behavior
+    processing_ms = int((time.time() - t0) * 1000)
+
+    # YOLO output directory and image path
+    output_dir = results[0].save_dir if hasattr(results[0], "save_dir") else OUTPUT_BASE
+    output_file = os.path.join(output_dir, filename)
+    output_file = os.path.abspath(output_file)
+
+    # build detections list (label + confidence)
+    detections = []
+    probs = {}
+    for box in results[0].boxes:
+        cls = int(box.cls)
+        label = model.names.get(cls, str(cls))
+        conf = float(box.conf)
+        detections.append({"label": label, "confidence": round(conf, 4)})
+        # store best per label (if multiple boxes same label keep max)
+        probs[label] = max(probs.get(label, 0.0), conf)
+
+    # compute quality related fields
+    raw_conf = max(probs.values()) if probs else 0.0
+    calibrated = calibrate_confidence(raw_conf)
+    quality_score = compute_quality_score(probs)
+
+    # attach quick audit for this request (HTML path)
+    request_id = str(uuid.uuid4())
+    audit = {
+        "request_id": request_id,
+        "type": "html_predict",
+        "uploaded_filename": filename,
+        "detections": detections,
+        "probabilities": probs,
+        "confidence": round(raw_conf, 4),
+        "calibrated_confidence": calibrated,
+        "quality_score": quality_score,
+        "model_version": MODEL_VERSION,
+        "processing_ms": processing_ms,
+        "timestamp": now_ts()
+    }
+    append_audit(audit)
+
+    # render original template (update your template to use these variables)
+    return render_template(
+        "result.html",
+        uploaded_image=filename,
+        result_image=output_file,
+        detections=detections,
+        confidence=round(raw_conf, 4),
+        calibrated_confidence=calibrated,
+        quality_score=quality_score,
+        request_id=request_id
+    )
+
+# -------------------------
+# JSON API endpoints
+# -------------------------
+@app.route("/api/v1/predict", methods=["POST"])
+def predict_api():
+    """
+    API endpoint for programmatic clients.
+    Accepts:
+      - multipart form upload with field 'image' (file)
+      - or JSON with 'image_base64' (not implemented here)
+    Returns JSON:
+      {
+        request_id, detections: [{label, confidence}], probabilities: {label: confidence},
+        confidence, calibrated_confidence, quality_score, model_version, processing_ms, timestamp
+      }
+    """
+    request_id = str(uuid.uuid4())
+    t0 = time.time()
+
+    # Support form upload
+    if 'image' in request.files:
+        file = request.files['image']
+        filename = secure_filename(file.filename) or f"{request_id}.jpg"
+        file_path = os.path.join(app.config["UPLOAD_FOLDER"], filename)
+        file.save(file_path)
+    else:
+        return jsonify({"error": "No image provided. Use multipart form-data field 'image'."}), 400
+
+    # model prediction
+    results = model.predict(file_path, save=False)  # don't save by default for API; save=False speeds up
+    processing_ms = int((time.time() - t0) * 1000)
+
+    detections = []
+    probs = {}
+    if len(results) and hasattr(results[0], "boxes"):
+        for box in results[0].boxes:
+            cls = int(box.cls)
+            label = model.names.get(cls, str(cls))
+            conf = float(box.conf)
+            detections.append({"label": label, "confidence": round(conf, 4)})
+            probs[label] = max(probs.get(label, 0.0), conf)
+
+    raw_conf = max(probs.values()) if probs else 0.0
+    calibrated = calibrate_confidence(raw_conf)
+    quality_score = compute_quality_score(probs)
+
+    resp = {
+        "request_id": request_id,
+        "detections": detections,
+        "probabilities": {k: round(v, 4) for k, v in probs.items()},
+        "confidence": round(raw_conf, 4),
+        "calibrated_confidence": calibrated,
+        "quality_score": quality_score,
+        "model_version": MODEL_VERSION,
+        "processing_ms": processing_ms,
+        "timestamp": now_ts()
+    }
+
+    # audit
+    audit = {
+        "request_id": request_id,
+        "type": "api_predict",
+        "request_form": "<multipart image>",
+        "detections": detections,
+        "probabilities": resp["probabilities"],
+        "confidence": resp["confidence"],
+        "calibrated_confidence": resp["calibrated_confidence"],
+        "quality_score": resp["quality_score"],
+        "model_version": resp["model_version"],
+        "processing_ms": resp["processing_ms"],
+        "timestamp": resp["timestamp"]
+    }
+    append_audit(audit)
+
+    return jsonify(resp), 200
+
+@app.route("/api/v1/logs", methods=["GET"])
+def get_logs():
+    """
+    Fetch audits.
+    - ?request_id=<id> to get single audit
+    - default: return last 20 audits
+    """
+    request_id = request.args.get("request_id")
+    if request_id:
+        result = AUDIT_STORE.get(request_id)
+        if not result:
+            # fallback: scan file (simple)
+            try:
+                with open(AUDIT_LOG_FILE, "r", encoding="utf-8") as f:
+                    for line in f:
+                        j = json.loads(line)
+                        if j.get("request_id") == request_id:
+                            return jsonify(j), 200
+            except FileNotFoundError:
+                pass
+            return jsonify({"error": "request_id not found"}), 404
+        return jsonify(result), 200
+
+    # return most recent N from the file (cheap)
+    tries = []
+    try:
+        if os.path.exists(AUDIT_LOG_FILE):
+            with open(AUDIT_LOG_FILE, "r", encoding="utf-8") as f:
+                for line in f:
+                    tries.append(json.loads(line))
+    except Exception:
+        app.logger.exception("failed reading audits file")
+    # return last 20
+    return jsonify(tries[-20:]), 200
+
+@app.route("/api/v1/health", methods=["GET"])
+def health():
+    return jsonify({
+        "status": "ok",
+        "model_version": MODEL_VERSION,
+        "model_path": MODEL_PATH
+    }), 200
+
+# -------------------------
+# Serve result image with safe path
+# -------------------------
+@app.route("/result/<path:filename>")
+def result_file(filename):
+    # serve files relative to project root. Adjust if you want to restrict directory.
+    safe_path = os.path.abspath(filename)
+    if not os.path.exists(safe_path):
+        return "File not found", 404
+    # send_from_directory expects directory and filename
+    return send_from_directory(os.path.dirname(safe_path), os.path.basename(safe_path))
+
+# -------------------------
+# Main
+# -------------------------
+if __name__ == "__main__":
+    app.run(debug=True, port=5000)
